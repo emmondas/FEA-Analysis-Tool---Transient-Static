@@ -1,0 +1,697 @@
+classdef FEA_Analysis_Das_Transient < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure                        matlab.ui.Figure
+        TimeStepSlider                  matlab.ui.control.Slider
+        TimeStepSliderLabel             matlab.ui.control.Label
+        Panel                           matlab.ui.container.Panel
+        LoadFrequencyEditField          matlab.ui.control.NumericEditField
+        LoadFrequencyEditFieldLabel     matlab.ui.control.Label
+        SinusoidalLoadCheckBox          matlab.ui.control.CheckBox
+        InitialTempEditField            matlab.ui.control.NumericEditField
+        InitialTempEditFieldLabel       matlab.ui.control.Label
+        TimeStepEditField               matlab.ui.control.NumericEditField
+        TimeStepEditFieldLabel          matlab.ui.control.Label
+        EndTimeEditField                matlab.ui.control.NumericEditField
+        EndTimeEditFieldLabel           matlab.ui.control.Label
+        ConvectionCoeffEditField_2      matlab.ui.control.NumericEditField
+        ConvectionCoeffEditField_2Label  matlab.ui.control.Label
+        OutsideTemperatureCEditField_2  matlab.ui.control.NumericEditField
+        OutsideTemperatureCEditField_2Label  matlab.ui.control.Label
+        HeatFluxWm2EditField_2          matlab.ui.control.NumericEditField
+        HeatFluxWm2EditField_2Label     matlab.ui.control.Label
+        LoadTypeButtonGroup             matlab.ui.container.ButtonGroup
+        DistributedLoadButton_2         matlab.ui.control.RadioButton
+        PointLoadButton_2               matlab.ui.control.RadioButton
+        ForceMagnitudeNEditField        matlab.ui.control.NumericEditField
+        ForceMagnitudeNEditFieldLabel   matlab.ui.control.Label
+        MaterialDropDown                matlab.ui.control.DropDown
+        TypeofstudyDropDown             matlab.ui.control.DropDown
+        TypeofstudyDropDownLabel        matlab.ui.control.Label
+        UploadSTLFileButton             matlab.ui.control.Button
+        MaterialDropDownLabel           matlab.ui.control.Label
+        SolveButton                     matlab.ui.control.Button
+        UIAxes                          matlab.ui.control.UIAxes
+    end
+
+    
+    properties (Access = private)
+        L_type          % 'Point Load' | 'Distributed Load'
+        Force_val       % N (point) or pressure in Pa (distributed)
+        type_study      % one of the four dropdown entries
+        Geometry        % imported DiscreteGeometry
+        Flux            % W/m^2
+        Conv            % W/(m^2*K)
+        Ambient_temp    % degC
+        Poission        % Poisson's ratio
+        Elastic_mod     % Pa
+        Thermal_conduc  % W/(m*K)
+        Mass_density    % kg/m^3   (required by both transient solvers)
+        Specific_heat   % J/(kg*K) (required by transient thermal)
+        Material        % material name
+        % --- Transient state ---
+        End_time        % s
+        Num_steps       % number of time steps
+        Initial_temp    % degC
+        Use_sine        % logical: sinusoidal structural load
+        Load_freq       % Hz
+        Sol_data        % nodes x timesteps result matrix (cached for slider)
+        Sol_model       % PDE model matching Sol_data
+        Sol_tlist       % time vector matching Sol_data
+        Sol_label       % title label for the cached solution
+   end
+    
+    methods (Access = private)
+      % Show/hide transient controls to match the selected study
+        function updateTransientVisibility(app)
+            isTransient = contains(app.type_study, 'Transient');
+            isThermal   = contains(app.type_study, 'Thermal');
+ 
+            app.Panel.Visible = matlab.lang.OnOffSwitchState(isTransient);
+ 
+            % Thermal-only transient controls
+            tOn = matlab.lang.OnOffSwitchState(isTransient && isThermal);
+            app.InitialTempEditField.Visible      = tOn;
+            app.InitialTempEditFieldLabel.Visible = tOn;
+ 
+            % Structural-only transient controls
+            sOn = matlab.lang.OnOffSwitchState(isTransient && ~isThermal);
+            app.SinusoidalLoadCheckBox.Visible      = sOn;
+            app.LoadFrequencyEditField.Visible      = sOn;
+            app.LoadFrequencyEditFieldLabel.Visible = sOn;
+            app.LoadFrequencyEditField.Enable = ...
+                matlab.lang.OnOffSwitchState(isTransient && ~isThermal && app.Use_sine);
+ 
+            % Structural inputs only matter for structural studies
+            sInputs = matlab.lang.OnOffSwitchState(~isThermal);
+            app.ForceMagnitudeNEditField.Enable = sInputs;
+            app.LoadTypeButtonGroup.Enable      = sInputs;
+ 
+            % Thermal inputs only matter for thermal studies
+            thInputs = matlab.lang.OnOffSwitchState(isThermal);
+            app.HeatFluxWm2EditField_2.Enable         = thInputs;
+            app.ConvectionCoeffEditField_2.Enable     = thInputs;
+            app.OutsideTemperatureCEditField_2.Enable = thInputs;
+        end
+ 
+        % Show or hide the time-step slider
+        function setSliderEnabled(app, tf)
+            state = matlab.lang.OnOffSwitchState(tf);
+            app.TimeStepSlider.Visible      = state;
+            app.TimeStepSliderLabel.Visible = state;
+            app.TimeStepSlider.Enable       = state;
+        end
+ 
+        % Draw one time step of the cached solution into the app axes
+        function renderSolution(app, idx)
+            if isempty(app.Sol_data)
+                return
+            end
+            idx = max(1, min(idx, size(app.Sol_data, 2)));
+ 
+            cla(app.UIAxes)
+            % pdeplot3D cannot target a UIAxes directly, so plot into a
+            % hidden figure and re-parent the graphics
+            tempFig = figure('Visible', 'off');
+            h = pdeplot3D(app.Sol_model, 'ColorMapData', app.Sol_data(:, idx));
+            h(2).Parent.Parent = app.UIAxes;
+            close(tempFig)
+ 
+            view(app.UIAxes, 45, 45)
+            colormap(app.UIAxes, 'turbo')
+            colorbar(app.UIAxes)
+            axis(app.UIAxes, 'equal')
+ 
+            if isscalar(app.Sol_tlist)
+                title(app.UIAxes, app.Sol_label)
+            else
+                title(app.UIAxes, sprintf('%s  |  t = %.4g s', ...
+                    app.Sol_label, app.Sol_tlist(idx)))
+            end
+        end
+    end
+    
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Code that executes after component creation
+        function startupFcn(app)
+            app.type_study     = 'Structural (Static)';
+            app.Material       = 'Stainless Steel';
+            app.Poission       = 0.25;
+            app.Elastic_mod    = 190e9;
+            app.Thermal_conduc = 16.2;
+            app.Mass_density   = 7900;
+            app.Specific_heat  = 500;
+            app.Force_val      = 250;
+            app.L_type         = 'Point Load';
+ 
+            app.Flux         = 1000;
+            app.Conv         = 25;
+            app.Ambient_temp = 25;
+ 
+            % Transient defaults
+            app.End_time     = 1;
+            app.Num_steps    = 50;
+            app.Initial_temp = 25;
+            app.Use_sine     = false;
+            app.Load_freq    = 10;
+ 
+            % Sync UI with internal defaults
+            app.ForceMagnitudeNEditField.Value     = app.Force_val;
+            app.HeatFluxWm2EditField_2.Value         = app.Flux;
+            app.ConvectionCoeffEditField_2.Value     = app.Conv;
+            app.OutsideTemperatureCEditField_2.Value = app.Ambient_temp;
+            app.EndTimeEditField.Value             = app.End_time;
+            app.TimeStepEditField.Value        = app.Num_steps;
+            app.InitialTempEditField.Value         = app.Initial_temp;
+            app.SinusoidalLoadCheckBox.Value       = app.Use_sine;
+            app.LoadFrequencyEditField.Value       = app.Load_freq;
+ 
+            updateTransientVisibility(app)
+            setSliderEnabled(app, false)
+        end
+
+        % Button pushed function: UploadSTLFileButton
+        function UploadSTLFileButtonPushed(app, event)
+           [file, path] = uigetfile('*.stl', 'Select an STL file');
+            figure(app.UIFigure)
+            if isequal(file, 0)
+                return
+            end
+            try
+                app.Geometry = importGeometry(fullfile(path, file));
+                % If your STL is in millimeters, uncomment to convert to meters:
+                % app.Geometry = scale(app.Geometry, 1e-3);
+            catch ME
+                uialert(app.UIFigure, ME.message, 'STL import failed');
+                return
+            end
+
+             app.Sol_data = [];
+            setSliderEnabled(app, false)
+ 
+            cla(app.UIAxes)
+            tempFig = figure('Visible', 'off');
+            pdegplot(app.Geometry, 'FaceLabels', 'on', 'FaceAlpha', 0.5);
+            copyobj(allchild(tempFig.CurrentAxes), app.UIAxes);
+            close(tempFig)
+            view(app.UIAxes, 45, 45)
+            axis(app.UIAxes, 'equal')
+            title(app.UIAxes, 'Imported Geometry (check face labels)')
+        end
+
+        % Value changed function: TypeofstudyDropDown
+        function TypeofstudyDropDownValueChanged(app, event)
+        app.type_study = app.TypeofstudyDropDown.Value;
+            updateTransientVisibility(app)
+        end
+
+        % Button down function: UIAxes
+        function UIAxesButtonDown(app, event)
+         
+        end
+
+        % Button pushed function: SolveButton
+        function SolveButtonPushed(app, event)
+            if isempty(app.Geometry)
+                uialert(app.UIFigure, ...
+                    'Upload an STL file before solving.', 'No geometry');
+                return
+            end
+ 
+            isTransient = contains(app.type_study, 'Transient');
+            if isTransient
+                if app.End_time <= 0 || app.Num_steps < 2
+                    uialert(app.UIFigure, ...
+                        'End time must be positive and there must be at least 2 time steps.', ...
+                        'Invalid time settings');
+                    return
+                end
+                tlist = linspace(0, app.End_time, app.Num_steps);
+            else
+                tlist = 0;   % placeholder, unused
+            end
+ 
+            F = app.Force_val;
+            cla(app.UIAxes)
+            setSliderEnabled(app, false)
+            d = uiprogressdlg(app.UIFigure, 'Title', 'Solving', ...
+                'Message', 'Meshing and solving...', 'Indeterminate', 'on');
+            cleanup = onCleanup(@() close(d));   %#ok<NASGU>
+ 
+            try
+                switch app.type_study
+ 
+                    % ---------- STRUCTURAL STATIC ----------
+                    case 'Structural (Static)'
+                        model = createpde('structural', 'static-solid');
+                        model.Geometry = app.Geometry;
+                        generateMesh(model);
+                        structuralProperties(model, ...
+                            'YoungsModulus', app.Elastic_mod, ...
+                            'PoissonsRatio', app.Poission);
+                        structuralBC(model, 'Face', 3, 'Constraint', 'fixed');
+                        applyStructuralLoad(app, model, F, false);
+                        sol = solve(model);
+                        resultData = sol.VonMisesStress;
+                        label = 'Structural Static - von Mises Stress (Pa)';
+ 
+                    % ---------- STRUCTURAL TRANSIENT ----------
+                    case 'Structural (Transient)'
+                        model = createpde('structural', 'transient-solid');
+                        model.Geometry = app.Geometry;
+                        generateMesh(model);
+                        % Transient needs mass density for the inertia term
+                        structuralProperties(model, ...
+                            'YoungsModulus', app.Elastic_mod, ...
+                            'PoissonsRatio', app.Poission, ...
+                            'MassDensity',   app.Mass_density);
+                        structuralBC(model, 'Face', 3, 'Constraint', 'fixed');
+                        applyStructuralLoad(app, model, F, app.Use_sine);
+                        % Start from rest
+                        structuralIC(model, ...
+                            'Displacement', [0; 0; 0], ...
+                            'Velocity',     [0; 0; 0]);
+                        sol = solve(model, tlist);
+                        % For a transient result this is nodes x timesteps
+                        resultData = evaluateVonMisesStress(sol);
+                        label = 'Structural Transient - von Mises Stress (Pa)';
+ 
+                    % ---------- THERMAL STEADY STATE ----------
+                    case 'Thermal (Steady State)'
+                        if any(isnan([app.Flux, app.Conv, app.Ambient_temp]))
+                            uialert(app.UIFigure, ...
+                                'Enter valid heat flux, convection coefficient, and ambient temperature.', ...
+                                'Missing thermal inputs');
+                            return
+                        end
+                        model = createpde('thermal', 'steadystate');
+                        model.Geometry = app.Geometry;
+                        generateMesh(model);
+                        thermalProperties(model, ...
+                            'ThermalConductivity', app.Thermal_conduc);
+                        thermalBC(model, 'Face', 3, 'HeatFlux', app.Flux);
+                        thermalBC(model, 'Face', [1 5 6 7], ...
+                            'ConvectionCoefficient', app.Conv, ...
+                            'AmbientTemperature', app.Ambient_temp);
+                        sol = solve(model);
+                        resultData = sol.Temperature;
+                        label = 'Thermal Steady State - Temperature (\circC)';
+ 
+                    % ---------- THERMAL TRANSIENT ----------
+                    case 'Thermal (Transient)'
+                        if any(isnan([app.Flux, app.Conv, app.Ambient_temp, app.Initial_temp]))
+                            uialert(app.UIFigure, ...
+                                'Enter valid heat flux, convection coefficient, ambient and initial temperature.', ...
+                                'Missing thermal inputs');
+                            return
+                        end
+                        model = createpde('thermal', 'transient');
+                        model.Geometry = app.Geometry;
+                        generateMesh(model);
+                        % Transient needs density and specific heat for the
+                        % thermal capacitance term
+                        thermalProperties(model, ...
+                            'ThermalConductivity', app.Thermal_conduc, ...
+                            'MassDensity',         app.Mass_density, ...
+                            'SpecificHeat',        app.Specific_heat);
+                        thermalBC(model, 'Face', 3, 'HeatFlux', app.Flux);
+                        thermalBC(model, 'Face', [1 5 6 7], ...
+                            'ConvectionCoefficient', app.Conv, ...
+                            'AmbientTemperature', app.Ambient_temp);
+                        thermalIC(model, app.Initial_temp);
+                        sol = solve(model, tlist);
+                        resultData = sol.Temperature;
+                        label = 'Thermal Transient - Temperature (\circC)';
+                end
+            catch ME
+                uialert(app.UIFigure, ME.message, 'Solve failed');
+                return
+            end
+ 
+            % Cache the solution so the slider can scrub without re-solving
+            app.Sol_data  = resultData;
+            app.Sol_model = model;
+            app.Sol_tlist = tlist;
+            app.Sol_label = label;
+ 
+            if isTransient && size(resultData, 2) > 1
+                nT = size(resultData, 2);
+                app.TimeStepSlider.Limits = [1 nT];
+                app.TimeStepSlider.Value  = nT;
+                app.TimeStepSlider.MajorTicks = round(linspace(1, nT, 5));
+                setSliderEnabled(app, true)
+                renderSolution(app, nT)     % show the final state first
+            else
+                setSliderEnabled(app, false)
+                renderSolution(app, 1)
+            end
+        end
+ 
+        % Apply the structural load, optionally time-varying
+        function applyStructuralLoad(app, model, F, useSine)
+            omega = 2 * pi * app.Load_freq;
+            switch app.L_type
+                case 'Point Load'
+                    if useSine
+                        structuralBoundaryLoad(model, 'Vertex', [3 2], ...
+                            'Force', @(location, state) ...
+                            [0; 0; -F * sin(omega * state.time)]);
+                    else
+                        structuralBoundaryLoad(model, 'Vertex', [3 2], ...
+                            'Force', [0; 0; -F]);
+                    end
+                case 'Distributed Load'
+                    if useSine
+                        structuralBoundaryLoad(model, 'Face', 5, ...
+                            'SurfaceTraction', @(location, state) ...
+                            [0; 0; -F * sin(omega * state.time)] ...
+                            .* ones(1, numel(location.x)));
+                    else
+                        structuralBoundaryLoad(model, 'Face', 5, ...
+                            'SurfaceTraction', [0; 0; -F]);
+                    end
+            end    
+        end
+
+        % Value changed function: MaterialDropDown
+        function MaterialDropDownValueChanged(app, event)
+            app.Material = app.MaterialDropDown.Value;
+            switch app.Material
+                case 'Stainless Steel'
+                    nu = 0.25;  E = 190e9;  K = 16.2;
+                case 'Brass'
+                    nu = 0.34;  E = 97e9;   K = 115;
+                case 'Aluminium'
+                    nu = 0.33;  E = 68e9;   K = 237;
+                otherwise
+                    return
+            end
+            app.Elastic_mod    = E;
+            app.Poission       = nu;
+            app.Thermal_conduc = K;
+        end
+
+        % Value changed function: ForceMagnitudeNEditField
+        function ForceMagnitudeNEditFieldValueChanged2(app, event)
+           app.Force_val = app.ForceMagnitudeNEditField.Value;
+        end
+
+        % Selection changed function: LoadTypeButtonGroup
+        function LoadTypeButtonGroupSelectionChanged(app, event)
+            if app.PointLoadButton_2.Value
+                    Load_type = 'Point Load';
+            else
+                if app.DistributedLoadButton_2.Value
+                    Load_type = 'Distributed Load';                    
+                end
+            end
+            app.L_type = Load_type;
+        end
+
+        % Value changed function: HeatFluxWm2EditField_2
+        function HeatFluxWm2EditField_2ValueChanged(app, event)
+            app.Flux = app.HeatFluxWm2EditField_2.Value;
+        end
+
+        % Value changed function: ConvectionCoeffEditField_2
+        function ConvectionCoeffEditField_2ValueChanged(app, event)
+            app.Conv = app.ConvectionCoeffEditField_2.Value;
+            
+        end
+
+        % Value changed function: OutsideTemperatureCEditField_2
+        function OutsideTemperatureCEditField_2ValueChanged(app, event)
+            app.Ambient_temp = app.OutsideTemperatureCEditField_2.Value;
+            
+        end
+
+        % Value changed function: TimeStepSlider
+        function TimeStepSliderValueChanged(app, event)
+            renderSolution(app, round(app.TimeStepSlider.Value));
+        end
+
+        % Value changed function: EndTimeEditField
+        function EndTimeEditFieldValueChanged(app, event)
+            app.End_time = app.EndTimeEditField.Value;
+        end
+
+        % Value changed function: TimeStepEditField
+        function TimeStepEditFieldValueChanged(app, event)
+            app.Num_steps = round(app.TimeStepEditField.Value);
+            app.TimeStepEditField.Value = app.Num_steps;
+        end
+
+        % Value changed function: InitialTempEditField
+        function InitialTempEditFieldValueChanged(app, event)
+            app.Initial_temp = app.InitialTempEditField.Value;
+        end
+
+        % Value changed function: SinusoidalLoadCheckBox
+        function SinusoidalLoadCheckBoxValueChanged(app, event)
+             app.Use_sine = app.SinusoidalLoadCheckBox.Value;
+            app.LoadFrequencyEditField.Enable = ...
+                matlab.lang.OnOffSwitchState(app.Use_sine);
+        end
+
+        % Value changed function: LoadFrequencyEditField
+        function LoadFrequencyEditFieldValueChanged(app, event)
+            app.Load_freq = app.LoadFrequencyEditField.Value;
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Get the file path for locating images
+            pathToMLAPP = fileparts(mfilename('fullpath'));
+
+            % Create UIFigure and hide until all components are created
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Color = [0.9412 0.9412 0.9412];
+            app.UIFigure.Position = [100 100 838 788];
+            app.UIFigure.Name = 'MATLAB App';
+
+            % Create UIAxes
+            app.UIAxes = uiaxes(app.UIFigure);
+            title(app.UIAxes, 'Title')
+            xlabel(app.UIAxes, 'X')
+            ylabel(app.UIAxes, 'Y')
+            zlabel(app.UIAxes, 'Z')
+            app.UIAxes.ButtonDownFcn = createCallbackFcn(app, @UIAxesButtonDown, true);
+            app.UIAxes.Position = [212 382 601 378];
+
+            % Create SolveButton
+            app.SolveButton = uibutton(app.UIFigure, 'push');
+            app.SolveButton.ButtonPushedFcn = createCallbackFcn(app, @SolveButtonPushed, true);
+            app.SolveButton.Icon = fullfile(pathToMLAPP, 'solution-strategy-icon.png');
+            app.SolveButton.IconAlignment = 'rightmargin';
+            app.SolveButton.BackgroundColor = [1 1 1];
+            app.SolveButton.FontWeight = 'bold';
+            app.SolveButton.FontColor = [0.149 0.149 0.149];
+            app.SolveButton.Position = [588 255 225 84];
+            app.SolveButton.Text = 'Solve';
+
+            % Create MaterialDropDownLabel
+            app.MaterialDropDownLabel = uilabel(app.UIFigure);
+            app.MaterialDropDownLabel.HorizontalAlignment = 'right';
+            app.MaterialDropDownLabel.Position = [73 510 58 24];
+            app.MaterialDropDownLabel.Text = 'Material';
+
+            % Create UploadSTLFileButton
+            app.UploadSTLFileButton = uibutton(app.UIFigure, 'push');
+            app.UploadSTLFileButton.ButtonPushedFcn = createCallbackFcn(app, @UploadSTLFileButtonPushed, true);
+            app.UploadSTLFileButton.Icon = fullfile(pathToMLAPP, 'upload-square-color-blue-icon.png');
+            app.UploadSTLFileButton.IconAlignment = 'top';
+            app.UploadSTLFileButton.Position = [57 647 110 83];
+            app.UploadSTLFileButton.Text = 'Upload STL File';
+
+            % Create TypeofstudyDropDownLabel
+            app.TypeofstudyDropDownLabel = uilabel(app.UIFigure);
+            app.TypeofstudyDropDownLabel.HorizontalAlignment = 'right';
+            app.TypeofstudyDropDownLabel.Position = [71 593 76 22];
+            app.TypeofstudyDropDownLabel.Text = 'Type of study';
+
+            % Create TypeofstudyDropDown
+            app.TypeofstudyDropDown = uidropdown(app.UIFigure);
+            app.TypeofstudyDropDown.Items = {'Structural (Static)', 'Structural (Transient)', 'Thermal (Steady State)', 'Thermal (Transient)'};
+            app.TypeofstudyDropDown.ValueChangedFcn = createCallbackFcn(app, @TypeofstudyDropDownValueChanged, true);
+            app.TypeofstudyDropDown.Position = [57 561 105 22];
+            app.TypeofstudyDropDown.Value = 'Structural (Static)';
+
+            % Create MaterialDropDown
+            app.MaterialDropDown = uidropdown(app.UIFigure);
+            app.MaterialDropDown.Items = {'Stainless Steel', 'Brass', 'Aluminium'};
+            app.MaterialDropDown.ValueChangedFcn = createCallbackFcn(app, @MaterialDropDownValueChanged, true);
+            app.MaterialDropDown.Position = [60 481 100 22];
+            app.MaterialDropDown.Value = 'Stainless Steel';
+
+            % Create ForceMagnitudeNEditFieldLabel
+            app.ForceMagnitudeNEditFieldLabel = uilabel(app.UIFigure);
+            app.ForceMagnitudeNEditFieldLabel.HorizontalAlignment = 'right';
+            app.ForceMagnitudeNEditFieldLabel.Position = [60 415 115 22];
+            app.ForceMagnitudeNEditFieldLabel.Text = 'Force Magnitude (N)';
+
+            % Create ForceMagnitudeNEditField
+            app.ForceMagnitudeNEditField = uieditfield(app.UIFigure, 'numeric');
+            app.ForceMagnitudeNEditField.ValueChangedFcn = createCallbackFcn(app, @ForceMagnitudeNEditFieldValueChanged2, true);
+            app.ForceMagnitudeNEditField.HorizontalAlignment = 'center';
+            app.ForceMagnitudeNEditField.Position = [89 382 57 22];
+
+            % Create LoadTypeButtonGroup
+            app.LoadTypeButtonGroup = uibuttongroup(app.UIFigure);
+            app.LoadTypeButtonGroup.SelectionChangedFcn = createCallbackFcn(app, @LoadTypeButtonGroupSelectionChanged, true);
+            app.LoadTypeButtonGroup.TitlePosition = 'centertop';
+            app.LoadTypeButtonGroup.Title = 'Load Type';
+            app.LoadTypeButtonGroup.BackgroundColor = [0.9412 0.9412 0.9412];
+            app.LoadTypeButtonGroup.Position = [57 272 231 78];
+
+            % Create PointLoadButton_2
+            app.PointLoadButton_2 = uiradiobutton(app.LoadTypeButtonGroup);
+            app.PointLoadButton_2.Text = 'Point Load';
+            app.PointLoadButton_2.Position = [11 32 79 22];
+            app.PointLoadButton_2.Value = true;
+
+            % Create DistributedLoadButton_2
+            app.DistributedLoadButton_2 = uiradiobutton(app.LoadTypeButtonGroup);
+            app.DistributedLoadButton_2.Text = 'Distributed Load';
+            app.DistributedLoadButton_2.Position = [11 10 109 22];
+
+            % Create HeatFluxWm2EditField_2Label
+            app.HeatFluxWm2EditField_2Label = uilabel(app.UIFigure);
+            app.HeatFluxWm2EditField_2Label.HorizontalAlignment = 'right';
+            app.HeatFluxWm2EditField_2Label.Position = [367 323 105 22];
+            app.HeatFluxWm2EditField_2Label.Text = 'Heat Flux (W/m^2)';
+
+            % Create HeatFluxWm2EditField_2
+            app.HeatFluxWm2EditField_2 = uieditfield(app.UIFigure, 'numeric');
+            app.HeatFluxWm2EditField_2.ValueChangedFcn = createCallbackFcn(app, @HeatFluxWm2EditField_2ValueChanged, true);
+            app.HeatFluxWm2EditField_2.Position = [371 286 100 22];
+
+            % Create OutsideTemperatureCEditField_2Label
+            app.OutsideTemperatureCEditField_2Label = uilabel(app.UIFigure);
+            app.OutsideTemperatureCEditField_2Label.HorizontalAlignment = 'right';
+            app.OutsideTemperatureCEditField_2Label.Position = [639 198 140 22];
+            app.OutsideTemperatureCEditField_2Label.Text = 'Outside Temperature (C) ';
+
+            % Create OutsideTemperatureCEditField_2
+            app.OutsideTemperatureCEditField_2 = uieditfield(app.UIFigure, 'numeric');
+            app.OutsideTemperatureCEditField_2.ValueChangedFcn = createCallbackFcn(app, @OutsideTemperatureCEditField_2ValueChanged, true);
+            app.OutsideTemperatureCEditField_2.Position = [658 167 100 22];
+
+            % Create ConvectionCoeffEditField_2Label
+            app.ConvectionCoeffEditField_2Label = uilabel(app.UIFigure);
+            app.ConvectionCoeffEditField_2Label.HorizontalAlignment = 'right';
+            app.ConvectionCoeffEditField_2Label.Position = [369 209 100 22];
+            app.ConvectionCoeffEditField_2Label.Text = 'Convection Coeff.';
+
+            % Create ConvectionCoeffEditField_2
+            app.ConvectionCoeffEditField_2 = uieditfield(app.UIFigure, 'numeric');
+            app.ConvectionCoeffEditField_2.ValueChangedFcn = createCallbackFcn(app, @ConvectionCoeffEditField_2ValueChanged, true);
+            app.ConvectionCoeffEditField_2.Position = [370 179 100 22];
+
+            % Create Panel
+            app.Panel = uipanel(app.UIFigure);
+            app.Panel.Title = 'Panel';
+            app.Panel.Position = [58 20 230 221];
+
+            % Create EndTimeEditFieldLabel
+            app.EndTimeEditFieldLabel = uilabel(app.Panel);
+            app.EndTimeEditFieldLabel.HorizontalAlignment = 'right';
+            app.EndTimeEditFieldLabel.Position = [25 159 56 22];
+            app.EndTimeEditFieldLabel.Text = 'End Time';
+
+            % Create EndTimeEditField
+            app.EndTimeEditField = uieditfield(app.Panel, 'numeric');
+            app.EndTimeEditField.ValueChangedFcn = createCallbackFcn(app, @EndTimeEditFieldValueChanged, true);
+            app.EndTimeEditField.Position = [96 159 100 22];
+
+            % Create TimeStepEditFieldLabel
+            app.TimeStepEditFieldLabel = uilabel(app.Panel);
+            app.TimeStepEditFieldLabel.HorizontalAlignment = 'right';
+            app.TimeStepEditFieldLabel.Position = [26 120 59 22];
+            app.TimeStepEditFieldLabel.Text = 'Time Step';
+
+            % Create TimeStepEditField
+            app.TimeStepEditField = uieditfield(app.Panel, 'numeric');
+            app.TimeStepEditField.ValueChangedFcn = createCallbackFcn(app, @TimeStepEditFieldValueChanged, true);
+            app.TimeStepEditField.Position = [100 120 100 22];
+
+            % Create InitialTempEditFieldLabel
+            app.InitialTempEditFieldLabel = uilabel(app.Panel);
+            app.InitialTempEditFieldLabel.HorizontalAlignment = 'right';
+            app.InitialTempEditFieldLabel.Position = [27 84 65 22];
+            app.InitialTempEditFieldLabel.Text = 'Initial Temp';
+
+            % Create InitialTempEditField
+            app.InitialTempEditField = uieditfield(app.Panel, 'numeric');
+            app.InitialTempEditField.ValueChangedFcn = createCallbackFcn(app, @InitialTempEditFieldValueChanged, true);
+            app.InitialTempEditField.Position = [107 84 100 22];
+
+            % Create SinusoidalLoadCheckBox
+            app.SinusoidalLoadCheckBox = uicheckbox(app.Panel);
+            app.SinusoidalLoadCheckBox.ValueChangedFcn = createCallbackFcn(app, @SinusoidalLoadCheckBoxValueChanged, true);
+            app.SinusoidalLoadCheckBox.Text = 'Sinusoidal Load ';
+            app.SinusoidalLoadCheckBox.Position = [40 46 115 22];
+
+            % Create LoadFrequencyEditFieldLabel
+            app.LoadFrequencyEditFieldLabel = uilabel(app.Panel);
+            app.LoadFrequencyEditFieldLabel.HorizontalAlignment = 'right';
+            app.LoadFrequencyEditFieldLabel.Position = [8 13 92 22];
+            app.LoadFrequencyEditFieldLabel.Text = 'Load Frequency';
+
+            % Create LoadFrequencyEditField
+            app.LoadFrequencyEditField = uieditfield(app.Panel, 'numeric');
+            app.LoadFrequencyEditField.ValueChangedFcn = createCallbackFcn(app, @LoadFrequencyEditFieldValueChanged, true);
+            app.LoadFrequencyEditField.Position = [115 13 100 22];
+
+            % Create TimeStepSliderLabel
+            app.TimeStepSliderLabel = uilabel(app.UIFigure);
+            app.TimeStepSliderLabel.HorizontalAlignment = 'right';
+            app.TimeStepSliderLabel.Position = [312 55 93 22];
+            app.TimeStepSliderLabel.Text = 'Time Step Slider';
+
+            % Create TimeStepSlider
+            app.TimeStepSlider = uislider(app.UIFigure);
+            app.TimeStepSlider.ValueChangedFcn = createCallbackFcn(app, @TimeStepSliderValueChanged, true);
+            app.TimeStepSlider.Position = [426 64 376 3];
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = FEA_Analysis_Das_Transient
+
+            % Create UIFigure and components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            % Execute the startup function
+            runStartupFcn(app, @startupFcn)
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end
